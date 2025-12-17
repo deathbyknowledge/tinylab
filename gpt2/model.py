@@ -1,7 +1,89 @@
 from dataclasses import dataclass
-from tinygrad import Tensor, dtypes, nn, Variable, TinyJit, Device
+from tinygrad import Tensor, Variable, nn, Context, dtypes, TinyJit, UOp
+from tinygrad.helpers import DEBUG, JIT, getenv
+from typing import Optional, Union
+import tiktoken
 import math
 
+MAX_CONTEXT = getenv("MAX_CONTEXT", 128)
+HALF = getenv("HALF")
+
+class MultiHeadAttention:
+    def __init__(self, dim, n_heads):
+        self.c_attn = nn.Linear(dim, 3*dim) # x3 (Q,K,V)
+        self.c_proj = nn.Linear(dim, dim)
+        self.n_heads = n_heads
+        self.dim = dim
+        self.head_dim = dim // n_heads
+
+    def __call__(self, x: Tensor, start_pos:Variable, mask:Optional[Tensor]) -> Tensor:
+        # x is (B, T, dim)
+        if mask is not None or start_pos.val == 0:
+            # no symbolic shape qkv when consuming prompts, (prefill?)
+            start_pos = start_pos.val
+        
+        if HALF: x = x.half() # use float16
+
+        # (B, T, dim) @ (dim, 3*dim) -> (B, T, 3*dim) (calc all q,k,v for all heads)
+        # (B, T, 3*dim) reshaped -> (B, T, 3, n_head, head_dim) (3 = [Q, K, V]
+        xqkv = self.c_attn(x).reshape(None, None, 3, self.n_heads, self.head_dim)
+        xq, xk, xv = [xqkv[:, :, i, :, :] for i in range(3)]
+        bs, seqlen, _, _ = xq.shape
+        
+        if not hasattr(self, "cache_kv"):
+            self.cache_kv = Tensor.zeros(2, bs, MAX_CONTEXT, self.n_heads, self.head_dim, dtype=x.dtype).contiguous().realize()
+        
+        # update the cache
+        cache_kv_slice = self.cache_kv[:, :, start_pos:start_pos+seqlen, :, :]
+        xkv_new = Tensor.stack(xk, xv)
+        cache_kv_slice.assign(xkv_new).realize()
+
+        # use the cache if prefill already happened
+        if start_pos > 0:
+            keys = self.cache_kv[0][:, :start_pos+seqlen, :, :]
+            values = self.cache_kv[1][:, :start_pos+seqlen, :, :]
+        else:
+            keys = xk
+            values = xv
+
+        # tranpose to get seqlen dim at -2 and head_dim at -1
+        xq, keys, values = xq.transpose(1, 2), keys.transpose(1,2), values.transpose(1,2)
+        # perform attn and tranpose back and reshape -1 to `self.dim`, effectively concatenating back
+        scale = 1.0 / math.sqrt(xq.size(-1))
+        attn = xq @ keys.transpose(-2, -1) * scale
+
+        if mask is None:
+           mask = attn.ones_like(requires_grad=False, device=attn.device, dtype=dtypes.bool).where(0, -float("inf"))
+
+        attn += mask
+
+        attn = attn.softmax(-1) @ values
+        xcat = attn.transpose(1, 2).reshape(bs, seqlen, self.dim)
+        # final projection, yay!
+        return self.c_proj(xcat)
+
+class MLP():
+  def __init__(self, dim, hidden_dim):
+    self.c_fc = nn.Linear(dim, hidden_dim)
+    self.c_proj = nn.Linear(hidden_dim, dim)
+
+  def __call__(self, x: Tensor) -> Tensor:
+    x = self.c_fc(x).gelu() # i dont think tinygrad has tanh approx
+    return self.c_proj(x)
+
+class Block():
+  def __init__(self, dim, n_heads):
+    self.ln_1 = nn.LayerNorm(dim)
+    self.attn = MultiHeadAttention(dim, n_heads)
+    self.ln_2 = nn.LayerNorm(dim)
+    self.mlp = MLP(dim, 4*dim) # TODO: read art on why 4 is a good number here
+
+  def __call__(self, x: Tensor, start_pos:Variable, mask:Optional[Tensor]) -> Tensor:
+    x = x + self.attn(self.ln_1(x), start_pos, mask)
+    x = x + self.mlp(self.ln_2(x)).contiguous()
+    return x
+
+        
 @dataclass
 class GPTConfig:
   block_size: int = 256
@@ -10,140 +92,52 @@ class GPTConfig:
   n_head: int = 6
   n_embd: int = 384
 
-
-class CausalSelfAttention():
-  def __init__(self, config: GPTConfig):
-    assert config.n_embd % config.n_head == 0
-    # key, query, value projections for all heads
-    self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
-    # output projection
-    self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-    # regularization
-    self.n_head = config.n_head
-    self.n_embd = config.n_embd
-
-    # this is the attn mask but gpt2 called it "bias"
-    self.bias = Tensor.ones(config.block_size, config.block_size, requires_grad=False).tril() \
-                      .view(1, 1, config.block_size, config.block_size)
-
-    # kv cache
-    self.k_total = None
-    self.v_total = None
-
-  def __call__(self, x: Tensor) -> Tensor:
-    B,T,C = x.size() # batch size, seq len, n_embd
-    assert C == self.n_embd
-
-    if Tensor.training:
-      qkv = self.c_attn(x) # (B, T, 3*n_embd)
-      q, k, v = qkv.split(self.n_embd, dim=2) # (3, B, T, n_embd)
-      q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, n_head, T, head_size)
-      k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, n_head, T, head_size)
-      v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, n_head, T, head_size)
-    
-      att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1))) # (B, n_head, T, T)
-      att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf')) # (B, n_head, T, T)
-      att = att.softmax() # (B, n_head, T, T)
-      y = att @ v # (B, n_head, T, head_size)
-      y = y.transpose(1, 2) # (B, T, n_head, head_size)
-      y = y.view(B, T, C) # (B, T, C) since C = n_head * head_size = n_embd
-      # output projection
-      y = self.c_proj(y)
-      
-      return y
-
-    else:
-      qkv = self.c_attn(x) # (B, T, 3*n_embd)
-      q, k_new, v_new = qkv.split(self.n_embd, dim=2) # (3, B, T, n_embd)
-      q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, n_head, T, head_size)
-      k_new = k_new.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, n_head, T, head_size)
-      v_new = v_new.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, n_head, T, head_size)
-
-      # q is (B, n_head, 1, head_size)
-      # k.T is (B, n_head, head_size, 1) -> we want it to be T (of the entire sequence)
-      # desired: q @ k.T -> 1xT (instead of 1x1, or TxT)
-
-      # Initialize KV Cache if empty (prefill)
-      if self.k_total is None or self.v_total is None:
-        self.k_total = k_new # (B, n_head, T, head_size)
-        self.v_total = v_new # (B, n_head, T, head_size)
-      else:  # decode (single new token)
-        self.k_total = self.k_total.cat(k_new, dim=2) # (B, n_head, T+1, head_size)
-        self.v_total = self.v_total.cat(v_new, dim=2) # (B, n_head, T+1, head_size)
-      T_total = self.k_total.size(2)
-
-      att = (q @ self.k_total.transpose(-2, -1)) * (1.0 / math.sqrt(self.k_total.size(-1))) # (B, n_head, T, T)
-      if T > 1:
-        att = att.masked_fill(self.bias[:,:,:T,:T_total] == 0, float('-inf')) # (B, n_head, T, T) 
-      att = att.softmax() # (B, n_head, T, T)
-      y = att @ self.v_total # (B, n_head, T, head_size)
-      y = y.transpose(1, 2) # (B, T, n_head, head_size)
-      y = y.view(B, T, C) # (B, T, C) since C = n_head * head_size = n_embd
-      # output projection
-      y = self.c_proj(y)
-      return y
-
-class MLP():
-  def __init__(self, config: GPTConfig):
-    self.config = config
-    self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
-    self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
-
-  def __call__(self, x: Tensor) -> Tensor:
-    x = self.c_fc(x)
-    x = x.gelu() # gelu approximation used in gpt2 paper
-    x = self.c_proj(x)
-    return x
-
-class Block():
-  def __init__(self, config: GPTConfig):
-    self.conifg = config
-    self.ln_1 = nn.LayerNorm(config.n_embd)
-    self.attn = CausalSelfAttention(config)
-    self.ln_2 = nn.LayerNorm(config.n_embd)
-    self.mlp = MLP(config)
-
-  def __call__(self, x: Tensor) -> Tensor:
-    x = x + self.attn(self.ln_1(x))
-    x = x + self.mlp(self.ln_2(x))
-    return x
-
 class GPT():
   def __init__(self, config: GPTConfig):
     self.config = config
     self.transformer = dict(
       wte=nn.Embedding(config.vocab_size, config.n_embd),
       wpe=nn.Embedding(config.block_size, config.n_embd),
-      h=[Block(config) for _ in range(config.n_layer)],
+      h=[Block(config.n_embd, config.n_head) for _ in range(config.n_layer)],
       ln_f=nn.LayerNorm(config.n_embd),
     )
     self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-    self.last_pos = None # last token pos (when using kv cache)
+    self.forward_jit = TinyJit(self.forward)
 
-  def __call__(self, idx):
-    # idx is of shape (B, T)
-    B, T = idx.size()
-    assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is {self.config.block_size}"
 
-    # forward the token and position embeddings
-    if Tensor.training:
-      pos = Tensor.arange(0, T, dtype=dtypes.long, device=idx.device) # shape (T)
-    elif self.last_pos is None: # prefill
-      pos = Tensor.arange(0, T, dtype=dtypes.long, device=idx.device) # shape (T)
-      self.last_pos = Tensor(T-1, dtype=dtypes.long)
+  def __call__(self, tokens:Union[Tensor,UOp], start_pos:Variable):
+    forward = (self.forward_jit if JIT and (isinstance(tokens, UOp) or tokens.shape[1] == 1) else self.forward)
+    return forward(tokens, start_pos)
+
+  def forward(self, tokens:Union[Tensor,UOp], start_pos:Variable):
+    if not hasattr(self, 'allpos'): self.allpos = Tensor.arange(0, MAX_CONTEXT).reshape(1, -1).realize()
+    if isinstance(tokens, UOp):
+      seqlen = 1
+      tok_emb = self.transformer['wte'].weight.shrink(((tokens, tokens+1), None))
     else:
-      pos = self.last_pos + 1
-      self.last_pos.assign(pos).realize()
-    pos_emb = self.transformer["wpe"](pos)
-    tok_emb = self.transformer["wte"](idx)
-    x = pos_emb + tok_emb
-    # forward the blocks of the transformer
-    for block in self.transformer['h']:
-      x = block(x)
-    # forward the final layernorm and the classifier
-    x = self.transformer['ln_f'](x)
-    logits = self.lm_head(x) # (B, T, vocab_size)
+      seqlen = tokens.shape[1]
+      tok_emb = self.transformer['wte'](tokens)
+
+    # not symbolic when consuming the prompt
+    selected_pos = (0, seqlen) if start_pos.val == 0 else (start_pos, start_pos+1)
+    pos_emb = self.transformer['wpe'](self.allpos.shrink((None, selected_pos)))
+
+    h = tok_emb + pos_emb
+
+    if HALF: h = h.half()
+
+    mask = Tensor.full((1, 1, seqlen, start_pos.val+seqlen), float("-inf"), dtype=h.dtype).triu(start_pos.val+1) if seqlen > 1 else None
+
+    for hi in self.transformer['h']: h = hi(h, start_pos, mask)
+
+    logits = self.lm_head(self.transformer['ln_f'](h)).realize()
     return logits
+
+
+  def __call__(self, tokens:Union[Tensor,UOp], start_pos:Variable) -> Tensor:
+    forward = (self.forward_jit if JIT and (isinstance(tokens, UOp) or tokens.shape[1] == 1) else self.forward)
+    return forward(tokens, start_pos)
+
 
 
   @classmethod
@@ -191,61 +185,43 @@ class GPT():
     nn.state.load_state_dict(model, sd)
     return model
 
-  
-  def generate(self, x: Tensor) -> Tensor:
-    t = Tensor.training
-    Tensor.training = False
-    Tensor.manual_seed(42)
-    """Prefill + Decode using KV Cache"""
-    B, T = x.size()
-    num_return_sequences = 5
-    max_length = 30
-    def sample(logits: Tensor):
-      # we only care about the newest predicted token
-      logits = logits[:,-1,:] # (B, 1, vocab_size)
-      probs = logits.softmax(axis=-1)
-      # do top-k sampling of 50 (hugginface pipeline default)
-      # topk_probs here becomes (5, 50), topk_indices is (5, 50)
-      topk_probs, topk_indices = probs.topk(50, dim=-1)
-      # select a token from the top-k probabilities
-      ix = topk_probs.multinomial(1)
-      # gather the corresponding indices
-      xcol = topk_indices.gather(-1, ix)
-      return xcol
+  def generate(self, prompt: str, max_length, batch_size):
+    enc = tiktoken.get_encoding('gpt2')
+    prompt_tokens = enc.encode(prompt)
+    toks = [prompt_tokens[:] for _ in range(batch_size)] # (5, 8) 
+    start_pos = 0
+    while len(toks[0]) < max_length:
+        print(len(toks[0]))
+        tokens = Tensor([x[start_pos:] for x in toks])
+        # forward the model to get the logits
+        logits = model(tokens, Variable("start_pos", 1 if start_pos else 0, MAX_CONTEXT-1).bind(start_pos))
+        # take the logits at the last position
+        logits = logits[:, -1, :] # (B, vocab_size)
+        # get the probabilities
+        probs = logits.softmax()
+        # do top-k sampling of 50 (huggingface pipeline default)
+        # topk_probs here becomes (5, 50), topk_indices is (5, 50)
+        topk_probs, topk_indices = probs.topk(50, dim=-1)
+        # select a token from the top-k probabilities
+        # note: multinomial does not demand the input to sum to 1
+        ix = topk_probs.multinomial(1) # (B, 1)
+        # gather the corresponding indices
+        tok = topk_indices.gather(-1, ix) # (B, 1)
+        start_pos = len(toks[0])
+        # append to sequence
+        for i,t in enumerate(tok.flatten().tolist()): toks[i].append(t)
 
-    # prefill
-    logits = self(x) # (B, T, vocab_size)
-    new_tok = sample(logits)
-    x = x.cat(new_tok, dim=1).realize()
-    #@TinyJit
-    def net(new_tok: Tensor):
-      logits = model(new_tok)
-      new_tok = sample(logits).realize()
-      return new_tok
-    # append to the sequence
-    while x.size(1) < max_length:
-      print('before decode', x.size(1))
-      new_tok = net(new_tok)
-      x = x.cat(new_tok, dim=1).realize()
-
-    Tensor.training = t
-    for i in range(num_return_sequences):
-      tokens = x[i, :max_length].tolist()
+    for tokens in toks:
       decoded = enc.decode(tokens)
       print(">", decoded)
+    
 
 
 if __name__ == "__main__":
   num_return_sequences = 5
   max_length = 30
 
+  Tensor.manual_seed(42)
   model = GPT.from_pretrained('gpt2')
-  import tiktoken
-  enc = tiktoken.get_encoding('gpt2')
-  tokens = enc.encode("Hello, I'm a language model,")
-  x = Tensor(tokens, dtype=dtypes.long) # (8,)
-  x = x.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
-  model.generate(x)
-  import sys
-  sys.exit(0)
-
+  with Context(BEAM=4):
+    model.generate("Hello, I'm a language model,", 30, 5)
