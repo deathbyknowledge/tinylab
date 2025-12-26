@@ -86,11 +86,11 @@ class Block():
         
 @dataclass
 class GPTConfig:
-  block_size: int = 256
-  vocab_size: int = 65
-  n_layer: int = 6
-  n_head: int = 6
-  n_embd: int = 384
+  block_size: int = 1024
+  vocab_size: int = 50257
+  n_layer: int = 12
+  n_head: int = 12
+  n_embd: int = 768
 
 class GPT():
   def __init__(self, config: GPTConfig):
@@ -104,10 +104,6 @@ class GPT():
     self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
     self.forward_jit = TinyJit(self.forward)
 
-
-  def __call__(self, tokens:Union[Tensor,UOp], start_pos:Variable):
-    forward = (self.forward_jit if JIT and (isinstance(tokens, UOp) or tokens.shape[1] == 1) else self.forward)
-    return forward(tokens, start_pos)
 
   def forward(self, tokens:Union[Tensor,UOp], start_pos:Variable):
     if not hasattr(self, 'allpos'): self.allpos = Tensor.arange(0, MAX_CONTEXT).reshape(1, -1).realize()
@@ -135,9 +131,8 @@ class GPT():
 
 
   def __call__(self, tokens:Union[Tensor,UOp], start_pos:Variable) -> Tensor:
-    forward = (self.forward_jit if JIT and (isinstance(tokens, UOp) or tokens.shape[1] == 1) else self.forward)
+    forward = (self.forward_jit if JIT and (isinstance(tokens, UOp) or tokens.shape[1] == 1 or tokens.shape[1] == self.config.block_size) else self.forward)
     return forward(tokens, start_pos)
-
 
 
   @classmethod
@@ -185,6 +180,11 @@ class GPT():
     nn.state.load_state_dict(model, sd)
     return model
 
+  def train_step(self, x: Tensor, y: Tensor):
+    logits = self(x, Variable("start_pos", 0, MAX_CONTEXT-1).bind(0))
+    loss = logits.reshape(-1, self.config.vocab_size).cross_entropy(y.reshape(-1)).realize()
+    return logits, loss
+
   def generate(self, prompt: str, max_length, batch_size):
     enc = tiktoken.get_encoding('gpt2')
     prompt_tokens = enc.encode(prompt)
@@ -218,10 +218,24 @@ class GPT():
 
 
 if __name__ == "__main__":
-  num_return_sequences = 5
-  max_length = 30
+  # num_return_sequences = 5
+  # max_length = 30
 
-  Tensor.manual_seed(42)
-  model = GPT.from_pretrained('gpt2')
-  with Context(BEAM=4):
-    model.generate("Hello, I'm a language model,", 30, 5)
+  # Tensor.manual_seed(42)
+  # model = GPT.from_pretrained('gpt2')
+  # with Context(BEAM=4):
+  #   model.generate("Hello, I'm a language model,", 30, 5)
+
+  enc = tiktoken.get_encoding('gpt2')
+  with open('input.txt', 'r') as f:
+    text = f.read()
+  text = text[:1000]
+  tokens = enc.encode(text)
+  B, T = 4, 32
+  buf = Tensor(tokens[:B*T+1])
+  x = buf[:-1].view(B, T)
+  y = buf[1:].view(B, T)
+  
+  model = GPT(GPTConfig())
+  logits, loss = model.train_step(x, y)
+  print(loss.item())
