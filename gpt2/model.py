@@ -21,7 +21,7 @@ class MultiHeadAttention:
         # x is (B, T, dim)
         if mask is not None or start_pos.val == 0:
             # no symbolic shape qkv when consuming prompts, (prefill?)
-            start_pos = start_pos.val
+            start_pos = start_pos.val  # ty:ignore[invalid-assignment]
         
         if HALF: x = x.half() # use float16
 
@@ -30,22 +30,27 @@ class MultiHeadAttention:
         xqkv = self.c_attn(x).reshape(None, None, 3, self.n_heads, self.head_dim)
         xq, xk, xv = [xqkv[:, :, i, :, :] for i in range(3)]
         bs, seqlen, _, _ = xq.shape
-        
-        if not hasattr(self, "cache_kv"):
-            self.cache_kv = Tensor.zeros(2, bs, MAX_CONTEXT, self.n_heads, self.head_dim, dtype=x.dtype).contiguous().realize()
-        
-        # update the cache
-        cache_kv_slice = self.cache_kv[:, :, start_pos:start_pos+seqlen, :, :]
-        xkv_new = Tensor.stack(xk, xv)
-        cache_kv_slice.assign(xkv_new).realize()
 
-        # use the cache if prefill already happened
-        if start_pos > 0:
+        if not Tensor.training:
+          if not hasattr(self, "cache_kv"):
+             self.cache_kv = Tensor.zeros(2, bs, MAX_CONTEXT, self.n_heads, self.head_dim, dtype=x.dtype).contiguous().realize()
+
+          # update the cache
+          cache_kv_slice = self.cache_kv[:, :, start_pos:start_pos+seqlen, :, :]
+          xkv_new = Tensor.stack(xk, xv)
+          cache_kv_slice.assign(xkv_new).realize()
+
+          # use the cache if prefill already happened
+          if start_pos > 0:
             keys = self.cache_kv[0][:, :start_pos+seqlen, :, :]
             values = self.cache_kv[1][:, :start_pos+seqlen, :, :]
-        else:
+          else:
             keys = xk
             values = xv
+
+        else:
+          keys = xk
+          values = xv
 
         # tranpose to get seqlen dim at -2 and head_dim at -1
         xq, keys, values = xq.transpose(1, 2), keys.transpose(1,2), values.transpose(1,2)
@@ -128,12 +133,12 @@ class GPT():
 
     for hi in self.h: h = hi(h, start_pos, mask)
 
-    logits = self.lm_head(self.ln_f(h)).realize()
+    logits = self.lm_head(self.ln_f(h))
     return logits
 
 
   def __call__(self, tokens:Union[Tensor,UOp], start_pos:UOp) -> Tensor:
-    forward = (self.forward_jit if JIT and (isinstance(tokens, UOp) or tokens.shape[1] == 1 or tokens.shape[1] == self.config.block_size) else self.forward)
+    forward = (self.forward_jit if JIT else self.forward)
     return forward(tokens, start_pos)
 
 
@@ -179,8 +184,8 @@ class GPT():
 
   def train_step(self, x: Tensor, y: Tensor):
     start_pos = Variable("start_pos", 0, MAX_CONTEXT-1).bind(0)
-    logits = self(x, Variable("start_pos", 0, MAX_CONTEXT-1).bind(0))
-    loss = logits.reshape(-1, self.config.vocab_size).cross_entropy(y.reshape(-1)).realize()
+    logits = self.forward(x, start_pos)
+    loss = logits.reshape(-1, self.config.vocab_size).cross_entropy(y.reshape(-1))
     return logits, loss
 
   def generate(self, prompt: str, max_length, batch_size):
@@ -220,9 +225,10 @@ if __name__ == "__main__":
   max_length = 30
 
   Tensor.manual_seed(42)
-  model = GPT.from_pretrained('gpt2')
+  #model = GPT.from_pretrained('gpt2')
   with Context(BEAM=2):
-    model.generate("Hello, I'm a language model,", 30, 5)
+    #model.generate("Hello, I'm a language model,", 30, 5)
+    pass
 
   enc = tiktoken.get_encoding('gpt2')
   with open('input.txt', 'r') as f:
@@ -235,5 +241,20 @@ if __name__ == "__main__":
   y = buf[1:].view(B, T)
   
   model = GPT(GPTConfig())
-  logits, loss = model.train_step(x, y)
-  print(loss.item())
+  params = nn.state.get_parameters(model)
+  optim = nn.optim.AdamW(params, lr=3e-4)
+
+  @TinyJit
+  def step():
+    Tensor.training = True
+    optim.zero_grad()
+    _, loss = model.train_step(x, y)
+    loss.backward()
+    optim.step()
+    return loss
+
+  with Context(BEAM=2):
+      for i in range(50):
+        loss = step()
+        print(f"step {i}, loss: {loss.item()}")
+
